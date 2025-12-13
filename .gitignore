@@ -17,6 +17,10 @@ models/model_train_log.jsonl
 # Keep folder, ignore heavy model binaries
 models/versions/*.pkl
 
+# Derived / runtime models (do not commit)
+models/base_model.pkl
+models/active_model.pkl
+
 # SQLite runtime DB
 decisions.db
 

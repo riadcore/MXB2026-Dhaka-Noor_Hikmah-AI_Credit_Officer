@@ -17,7 +17,6 @@ from fastapi.responses import (
     FileResponse,
     RedirectResponse,
 )
-
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
@@ -51,12 +50,11 @@ BASE_MODEL_PATH = MODELS_DIR / "base_model.pkl"
 ACTIVE_MODEL_PATH = MODELS_DIR / "active_model.pkl"
 FIRST_MODEL = MODELS_DIR / "credit_model.pkl"  # initial seed model (if present)
 
-# One-time bootstrap: create base + active from the first model
+# If a seed model is committed, create base + active from it
 if FIRST_MODEL.exists():
     if not BASE_MODEL_PATH.exists():
         shutil.copy2(FIRST_MODEL, BASE_MODEL_PATH)
         print("✅ Base model created:", BASE_MODEL_PATH)
-
     if not ACTIVE_MODEL_PATH.exists():
         shutil.copy2(FIRST_MODEL, ACTIVE_MODEL_PATH)
         print("✅ Active model initialized:", ACTIVE_MODEL_PATH)
@@ -70,7 +68,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", str(ACTIVE_MODEL_PATH))
 # -------------------------------------------------------------------
 app = FastAPI(
     title="AI Credit & Inclusion Platform - MVP",
-    version="0.5.0",
+    version="0.6.0",
 )
 
 
@@ -99,18 +97,54 @@ def load_training_metrics() -> None:
         TRAINING_METRICS = {}
 
 
+def ensure_baseline_bootstrap() -> None:
+    """
+    Railway-safe baseline bootstrap (NO VOLUME needed):
+    If version history / metrics are missing, train once from BOOTSTRAP_CSV to create:
+      - data/training/training_master.csv
+      - models/training_metrics.json
+      - models/model_train_log.jsonl
+      - models/versions/model_bundle_*.pkl
+      - models/base_model.pkl
+      - models/active_model.pkl
+    """
+    try:
+        has_versions = any(VERSIONS_DIR.glob("model_bundle_*.pkl"))
+        has_metrics = TRAINING_METRICS_PATH.exists()
+        has_log = MODEL_HISTORY_LOG.exists()
+
+        # If Railway starts fresh, these will be missing.
+        if (not has_versions) or (not has_metrics) or (not has_log) or (not ACTIVE_MODEL_PATH.exists()):
+            print("🧱 [BOOTSTRAP] Missing baseline artifacts. Bootstrapping baseline now...")
+
+            # train_from_export uses relative paths like "models/..." and "data/training/..."
+            # Make sure we are in project root.
+            os.chdir(str(BASE_DIR))
+
+            # This will generate versions + metrics + logs + base/active
+            train_from_export.bootstrap_from_specific_csv(train_from_export.BOOTSTRAP_CSV)
+
+            # Reload metrics after bootstrap
+            load_training_metrics()
+
+    except Exception as e:
+        # Don't crash the app; dashboard can still load
+        print(f"❌ [BOOTSTRAP] Failed: {e}")
+
+
 # -------------------------------------------------------------------
 # CORS + templates
 # -------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # OK for local dev; tighten in prod
+    allow_origins=["*"],  # OK for MVP; tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-templates = Jinja2Templates(directory="app/templates")
+# Use ABSOLUTE template directory (Railway working dir can differ)
+templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 
 
 # -------------------------------------------------------------------
@@ -131,7 +165,6 @@ def build_shap_explainer():
             return shap.TreeExplainer(model, data=background)
         return shap.TreeExplainer(model)
     except Exception:
-        # last-resort
         return shap.TreeExplainer(model)
 
 
@@ -147,7 +180,6 @@ def load_model_bundle(path: str | None = None) -> None:
 
     p = Path(MODEL_PATH)
     if not p.exists():
-        # Don't crash the whole app on cold boot; endpoints will error nicely if used
         print(f"❌ MODEL_PATH not found on disk: {p}")
         model_bundle = None
         model = None
@@ -229,6 +261,10 @@ def init_db():
 @app.on_event("startup")
 def _startup():
     init_db()
+
+    # ✅ NEW: ensure baseline version exists (so dashboard shows version immediately)
+    ensure_baseline_bootstrap()
+
     load_training_metrics()
     load_model_bundle()
 
@@ -317,20 +353,18 @@ def fetch_recent_decisions(limit: int = 50) -> list[dict]:
     rows = cur.fetchall()
     conn.close()
 
-    out: list[dict] = []
-    for r in rows:
-        out.append(
-            {
-                "id": r[0],
-                "borrower_id": r[1],
-                "risk_score": r[2],
-                "decision": r[3],
-                "fraud_score": r[4],
-                "fraud_label": r[5],
-                "created_at": r[6],
-            }
-        )
-    return out
+    return [
+        {
+            "id": r[0],
+            "borrower_id": r[1],
+            "risk_score": r[2],
+            "decision": r[3],
+            "fraud_score": r[4],
+            "fraud_label": r[5],
+            "created_at": r[6],
+        }
+        for r in rows
+    ]
 
 
 class OutcomeUpdate(BaseModel):
@@ -561,15 +595,11 @@ def deploy_model(version: str):
         raise HTTPException(status_code=404, detail="Version not found in history log")
 
     model_path = record.get("model_file_path")
-    if model_path:
-        model_path = Path(model_path)
-    else:
-        model_path = MODELS_DIR / f"credit_model_{version}.pkl"
+    model_path = Path(model_path) if model_path else (MODELS_DIR / f"credit_model_{version}.pkl")
 
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model file not found on disk")
 
-    # deploy -> ACTIVE model
     shutil.copy2(str(model_path), str(ACTIVE_MODEL_PATH))
     load_model_bundle(str(ACTIVE_MODEL_PATH))
 
@@ -598,10 +628,7 @@ def deploy_model(version: str):
 def delete_model(version: str):
     active_version = (TRAINING_METRICS or {}).get("version_tag")
     if active_version == version:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot delete the active model. Deploy another version first.",
-        )
+        raise HTTPException(status_code=400, detail="Cannot delete the active model. Deploy another version first.")
 
     if not MODEL_HISTORY_LOG.exists():
         raise HTTPException(status_code=404, detail="History log does not exist")
@@ -628,17 +655,12 @@ def delete_model(version: str):
     if not deleted_record:
         raise HTTPException(status_code=404, detail="Version not found in history log")
 
-    # rewrite log without deleted record
     with MODEL_HISTORY_LOG.open("w", encoding="utf-8") as f:
         for l in kept_lines:
             f.write(l if l.endswith("\n") else l.rstrip() + "\n")
 
-    # delete its .pkl
     model_path = deleted_record.get("model_file_path")
-    if model_path:
-        model_path = Path(model_path)
-    else:
-        model_path = MODELS_DIR / f"credit_model_{version}.pkl"
+    model_path = Path(model_path) if model_path else (MODELS_DIR / f"credit_model_{version}.pkl")
 
     if model_path.exists():
         try:
@@ -667,7 +689,6 @@ def active_model_info():
     if not p.exists():
         raise HTTPException(status_code=404, detail=f"Model path not found: {p}")
 
-    # hash first ~1MB to identify file quickly (fast & enough for checking changes)
     import hashlib
     h = hashlib.sha256()
     with open(p, "rb") as f:
@@ -679,9 +700,6 @@ def active_model_info():
         "size_bytes": p.stat().st_size,
         "sha256_1mb": h.hexdigest(),
     }
-
-
-
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -757,8 +775,7 @@ def training_export():
     )
     lines = [header]
     for r in rows:
-        line = ",".join([str(x) for x in r])
-        lines.append(line + "\n")
+        lines.append(",".join([str(x) for x in r]) + "\n")
 
     return "".join(lines)
 
@@ -795,13 +812,15 @@ def admin_retrain():
     After training completes, automatically activate the newest trained model.
     """
     try:
+        # Ensure correct working directory for relative paths inside train_from_export
+        os.chdir(str(BASE_DIR))
+
         _ = train_from_export.run()
 
         load_training_metrics()
 
         newest_path = (TRAINING_METRICS or {}).get("candidate_path") or (TRAINING_METRICS or {}).get("version_path")
-        if newest_path:
-            newest_path = Path(newest_path)
+        newest_path = Path(newest_path) if newest_path else None
 
         if newest_path and newest_path.exists():
             shutil.copy2(str(newest_path), str(ACTIVE_MODEL_PATH))
@@ -809,26 +828,19 @@ def admin_retrain():
         else:
             load_model_bundle(str(ACTIVE_MODEL_PATH))
 
-        return {
-            "status": "ok",
-            "message": "Retraining complete and activated.",
-            "metrics": TRAINING_METRICS,
-        }
+        return {"status": "ok", "message": "Retraining complete and activated.", "metrics": TRAINING_METRICS}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Retraining error: {e}")
 
 
-UPLOAD_DIR = DATA_DIR  # Railway-safe
+UPLOAD_DIR = DATA_DIR
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.post("/admin/upload_training_csv")
 async def upload_training_csv(file: UploadFile = File(...)):
     try:
-        import datetime
-
-        # ✅ NEW: timestamped filename to avoid retraining old data
         stamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         original = file.filename or "training.csv"
         filename = f"{stamp}_{original}"
@@ -837,7 +849,6 @@ async def upload_training_csv(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Only CSV files allowed.")
 
         save_path = UPLOAD_DIR / filename
-
         content = await file.read()
         save_path.write_bytes(content)
 
