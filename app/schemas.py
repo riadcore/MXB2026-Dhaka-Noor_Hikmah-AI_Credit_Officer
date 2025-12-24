@@ -21,7 +21,7 @@ class Factor(BaseModel):
     impact: float  # SHAP value
     direction: str  # "increased_risk" or "decreased_risk"
     detail: str     # human readable text
-
+    pct_influence: float | None = None
 
 class CreditScoreResponse(BaseModel):
     borrower_id: str

@@ -12,3 +12,4 @@ jinja2
 python-multipart
 aiofiles
 pydantic
+httpx>=0.28.0
