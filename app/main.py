@@ -51,7 +51,7 @@ def log_llm_startup_status():
         from groq import Groq
         client = Groq(api_key=api_key)
 
-        # ultra-light ping (no cost concern)
+     
         client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "ping"}],
