@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+pandas
+scikit-learn
+xgboost
+joblib
+python-multipart
+numpy
+shap
+scikit-learn
+jinja2
+python-multipart
+aiofiles
+pydantic
+httpx>=0.28.0
